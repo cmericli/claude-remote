@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Claude Remote - Web terminal for Claude Code sessions.
-Uses tmux for session management, allowing attach/detach from anywhere.
+Claude Remote v2.0 - Mission Control for Claude Code sessions.
+
+Enhanced FastAPI server with:
+- JSONL indexing and full-text search
+- Rich conversation viewer with thinking/tool data
+- Token analytics and cost estimation
+- Platform-adaptive process detection (Linux + macOS)
+- tmux session management with interactive/spectator WebSocket terminals
 """
 
 import asyncio
 import fcntl
 import json
+import logging
 import os
 import pty
 import re
@@ -16,81 +23,90 @@ import struct
 import subprocess
 import termios
 import time
-from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-# Configuration
+import indexer
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
 CLAUDE_BIN = Path.home() / ".local/bin/claude"
-CLAUDE_PROJECTS_DIR = Path.home() / ".claude/projects"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 DEFAULT_PORT = 7860
 SESSION_PREFIX = "claude-remote-"
+REINDEX_INTERVAL = 60  # seconds
 
-app = FastAPI(title="Claude Remote", version="0.5.0")
+logger = logging.getLogger("server")
+
+# ─── Background tasks ────────────────────────────────────────────────────────
+
+_reindex_task: Optional[asyncio.Task] = None
+
+
+async def _periodic_reindex():
+    """Background task that reindexes periodically."""
+    while True:
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, indexer.reindex_all)
+        except Exception as e:
+            logger.error(f"Periodic reindex failed: {e}")
+        await asyncio.sleep(REINDEX_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown lifecycle."""
+    global _reindex_task
+    logger.info("Starting initial reindex...")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, indexer.reindex_all)
+    logger.info("Initial reindex complete. Starting periodic reindex.")
+    _reindex_task = asyncio.create_task(_periodic_reindex())
+    yield
+    if _reindex_task:
+        _reindex_task.cancel()
+        try:
+            await _reindex_task
+        except asyncio.CancelledError:
+            pass
+
+
+# ─── App setup ────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Claude Remote", version="2.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
 def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
-def get_active_session_ids() -> set[str]:
-    """Get set of session IDs currently running based on process command lines."""
-    active_sessions = set()
-    
-    try:
-        ps_output = subprocess.check_output(['ps', 'aux'], text=True)
-        for line in ps_output.splitlines():
-            if 'claude' not in line.lower() or 'grep' in line or 'server.py' in line:
-                continue
-            if '--chrome-native-host' in line or '--claude-in-chrome-mcp' in line:
-                continue
-            
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            pid = parts[1]
-            
-            try:
-                with open(f'/proc/{pid}/cmdline', 'r') as f:
-                    cmdline = f.read().replace('\0', ' ')
-                cwd = os.readlink(f'/proc/{pid}/cwd')
-            except:
-                continue
-            
-            session_id = None
-            
-            # Check for --resume or --session-id in command line
-            match = re.search(r'--resume\s+([a-f0-9-]{36})', cmdline)
-            if match:
-                session_id = match.group(1)
-            else:
-                match = re.search(r'--session-id\s+([a-f0-9-]{36})', cmdline)
-                if match:
-                    session_id = match.group(1)
-            
-            # For --continue or plain claude, find most recent session in cwd
-            if not session_id and cwd:
-                project_dir = '-' + cwd.replace('/', '-').lstrip('-')
-                projects_path = CLAUDE_PROJECTS_DIR / project_dir
-                if projects_path.exists():
-                    sessions = list(projects_path.glob('*.jsonl'))
-                    if sessions:
-                        sessions.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-                        session_id = sessions[0].stem
-            
-            if session_id:
-                active_sessions.add(session_id)
-    
-    except subprocess.CalledProcessError:
-        pass
-    
-    return active_sessions
+def _get_active_and_tmux_ids() -> tuple[set, set]:
+    """Get both active session IDs and tmux session IDs."""
+    active = indexer.get_active_session_ids()
+    tmux = indexer.get_tmux_session_ids()
+    return active, tmux
+
+
+# ─── tmux session management (preserved from v0.5) ───────────────────────────
 
 
 def tmux_session_exists(session_name: str) -> bool:
@@ -103,7 +119,6 @@ def list_tmux_sessions() -> list[dict]:
         "tmux", "list-sessions", "-F",
         "#{session_name}|#{session_created}|#{pane_current_path}|#{pane_pid}"
     ])
-    
     sessions = []
     if result.returncode == 0:
         for line in result.stdout.strip().split("\n"):
@@ -120,17 +135,16 @@ def list_tmux_sessions() -> list[dict]:
     return sessions
 
 
-def get_tmux_session_ids() -> set[str]:
-    sessions = list_tmux_sessions()
-    return {s["name"].replace(SESSION_PREFIX, "") for s in sessions}
-
-
-def create_tmux_session(session_name: str, working_dir: str, resume_id: Optional[str] = None, cols: int = 120, rows: int = 36) -> bool:
+def create_tmux_session(session_name: str, working_dir: str,
+                        resume_id: Optional[str] = None,
+                        cols: int = 120, rows: int = 36) -> bool:
     cmd = str(CLAUDE_BIN)
     if resume_id:
         cmd = f"{CLAUDE_BIN} --resume {resume_id}"
-    
-    result = run_cmd(["tmux", "new-session", "-d", "-s", session_name, "-x", str(cols), "-y", str(rows), "-c", working_dir, cmd])
+    result = run_cmd([
+        "tmux", "new-session", "-d", "-s", session_name,
+        "-x", str(cols), "-y", str(rows), "-c", working_dir, cmd
+    ])
     return result.returncode == 0
 
 
@@ -145,169 +159,108 @@ def set_winsize(fd: int, rows: int, cols: int):
 
 
 def resize_tmux_session(session_name: str, cols: int, rows: int):
-    run_cmd(["tmux", "resize-window", "-t", session_name, "-x", str(cols), "-y", str(rows)])
+    run_cmd(["tmux", "resize-window", "-t", session_name,
+             "-x", str(cols), "-y", str(rows)])
 
 
-def parse_session_history(session_path: Path, limit: int = 200) -> list[dict]:
-    messages = []
-    try:
-        with open(session_path, 'r') as f:
-            for line in f:
-                try:
-                    entry = json.loads(line.strip())
-                    if entry.get("type") not in ("user", "assistant"):
-                        if "message" not in entry:
-                            continue
-                    
-                    msg = entry.get("message", {})
-                    role = msg.get("role") or entry.get("type")
-                    if role not in ("user", "assistant"):
-                        continue
-                    
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        text_parts = []
-                        for part in content:
-                            if isinstance(part, dict):
-                                if part.get("type") == "text":
-                                    text_parts.append(part.get("text", ""))
-                                elif part.get("type") == "tool_use":
-                                    text_parts.append(f"[Tool: {part.get('name', 'unknown')}]")
-                            elif isinstance(part, str):
-                                text_parts.append(part)
-                        content = "\n".join(text_parts)
-                    
-                    if content and content.strip():
-                        messages.append({
-                            "role": role,
-                            "content": content[:5000],
-                            "timestamp": entry.get("timestamp", ""),
-                        })
-                        if len(messages) >= limit:
-                            break
-                except json.JSONDecodeError:
-                    continue
-    except Exception as e:
-        print(f"Error parsing session: {e}")
-    return messages
+# ─── API Routes: Static / Index ──────────────────────────────────────────────
 
-
-@dataclass 
-class ExistingSession:
-    session_id: str
-    project_dir: str
-    working_dir: str
-    last_modified: datetime
-    size_bytes: int
-    is_running: bool = False
-    is_in_tmux: bool = False
-    
-    def to_dict(self):
-        return {
-            "session_id": self.session_id,
-            "project_dir": self.project_dir,
-            "working_dir": self.working_dir,
-            "last_modified": self.last_modified.isoformat(),
-            "size_mb": round(self.size_bytes / 1024 / 1024, 2),
-            "is_running": self.is_running,
-            "is_in_tmux": self.is_in_tmux,
-        }
-
-
-def discover_existing_sessions(limit: int = 30) -> list[ExistingSession]:
-    sessions_found = []
-    active_session_ids = get_active_session_ids()
-    tmux_ids = get_tmux_session_ids()
-    
-    if not CLAUDE_PROJECTS_DIR.exists():
-        return sessions_found
-    
-    for project_dir in CLAUDE_PROJECTS_DIR.iterdir():
-        if not project_dir.is_dir():
-            continue
-        
-        working_dir = "/" + project_dir.name.lstrip("-").replace("-", "/")
-        session_files = list(project_dir.glob("*.jsonl"))
-        session_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-        
-        for session_file in session_files[:5]:
-            session_id = session_file.stem
-            stat = session_file.stat()
-            
-            sessions_found.append(ExistingSession(
-                session_id=session_id,
-                project_dir=project_dir.name,
-                working_dir=working_dir,
-                last_modified=datetime.fromtimestamp(stat.st_mtime),
-                size_bytes=stat.st_size,
-                is_running=session_id in active_session_ids,
-                is_in_tmux=session_id[:8] in tmux_ids,
-            ))
-    
-    sessions_found.sort(key=lambda s: s.last_modified, reverse=True)
-    return sessions_found[:limit]
-
-
-# API Routes
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return FileResponse("static/index.html")
+async def index_page():
+    static_dir = Path(__file__).parent / "static"
+    index_html = static_dir / "index.html"
+    if index_html.exists():
+        return FileResponse(str(index_html))
+    return HTMLResponse("<h1>Claude Remote v2.0</h1><p>Static files not found.</p>")
+
+
+# ─── API Routes: Dashboard ───────────────────────────────────────────────────
+
+
+@app.get("/api/dashboard")
+async def api_dashboard():
+    active_ids, tmux_ids = _get_active_and_tmux_ids()
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, indexer.get_dashboard_data, active_ids, tmux_ids
+    )
+    return data
+
+
+# ─── API Routes: Sessions ────────────────────────────────────────────────────
 
 
 @app.get("/api/sessions")
-async def list_sessions():
-    tmux_sessions = list_tmux_sessions()
-    sessions = []
-    for ts in tmux_sessions:
-        session_id = ts["name"].replace(SESSION_PREFIX, "")
-        sessions.append({
-            "id": session_id,
-            "name": ts["name"],
-            "working_dir": ts["cwd"],
-            "created": datetime.fromtimestamp(ts["created"]).isoformat() if ts["created"] else None,
-            "pid": ts["pid"],
-            "tmux_session": ts["name"],
-        })
-    return {"sessions": sessions}
+async def api_sessions(
+    status: str = Query(default="all"),
+    project: Optional[str] = Query(default=None),
+    limit: int = Query(default=30, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    active_ids, tmux_ids = _get_active_and_tmux_ids()
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, indexer.get_sessions, active_ids, tmux_ids, status, project, limit, offset
+    )
+    return data
 
 
-@app.get("/api/existing-sessions")
-async def list_existing_sessions(limit: int = 30):
-    existing = discover_existing_sessions(limit=limit)
-    return {"sessions": [s.to_dict() for s in existing]}
+@app.get("/api/sessions/{session_id}")
+async def api_session_detail(session_id: str):
+    active_ids, tmux_ids = _get_active_and_tmux_ids()
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, indexer.get_session_detail, session_id, active_ids, tmux_ids
+    )
+    if data is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return data
 
 
-@app.get("/api/sessions/{session_id}/history")
-async def get_session_history(session_id: str, limit: int = 200):
-    for project_dir in CLAUDE_PROJECTS_DIR.iterdir():
-        if not project_dir.is_dir():
-            continue
-        session_file = project_dir / f"{session_id}.jsonl"
-        if session_file.exists():
-            messages = parse_session_history(session_file, limit)
-            return {
-                "session_id": session_id,
-                "project_dir": project_dir.name,
-                "message_count": len(messages),
-                "messages": messages,
-            }
-    raise HTTPException(status_code=404, detail="Session not found")
+@app.get("/api/sessions/{session_id}/conversation")
+async def api_conversation(
+    session_id: str,
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, indexer.get_conversation, session_id, limit, offset
+    )
+    if data is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return data
+
+
+# ─── API Routes: tmux session management (preserved from v0.5) ───────────────
 
 
 @app.post("/api/sessions")
-async def create_session(name: str = "Claude Session", working_dir: str = "~", resume_id: Optional[str] = None, rows: int = 36, cols: int = 120):
+async def create_session(
+    name: str = "Claude Session",
+    working_dir: str = "~",
+    resume_id: Optional[str] = None,
+    rows: int = 36,
+    cols: int = 120,
+):
     wd = os.path.expanduser(working_dir)
     if not os.path.isdir(wd):
         raise HTTPException(status_code=400, detail=f"Invalid directory: {wd}")
-    
+
     session_id = str(uuid4())[:8]
     tmux_name = f"{SESSION_PREFIX}{session_id}"
-    
+
     if not create_tmux_session(tmux_name, wd, resume_id, cols, rows):
         raise HTTPException(status_code=500, detail="Failed to create tmux session")
-    
-    return {"id": session_id, "name": name, "working_dir": wd, "tmux_session": tmux_name, "resume_id": resume_id}
+
+    return {
+        "id": session_id,
+        "name": name,
+        "working_dir": wd,
+        "tmux_session": tmux_name,
+        "resume_id": resume_id,
+    }
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -319,31 +272,101 @@ async def delete_session(session_id: str):
     return {"status": "terminated"}
 
 
+# ─── API Routes: Search ──────────────────────────────────────────────────────
+
+
+@app.get("/api/search")
+async def api_search(
+    q: str = Query(default=""),
+    project: Optional[str] = Query(default=None),
+    after: Optional[str] = Query(default=None),
+    before: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    if not q.strip():
+        return {"query": q, "results": [], "total": 0}
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, indexer.search, q, project, after, before, limit
+    )
+    return data
+
+
+# ─── API Routes: Analytics ───────────────────────────────────────────────────
+
+
+@app.get("/api/analytics/tokens")
+async def api_token_analytics(
+    period: str = Query(default="7d"),
+    group_by: str = Query(default="day"),
+):
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, indexer.get_token_analytics, period, group_by
+    )
+    return data
+
+
+@app.get("/api/analytics/tools")
+async def api_tool_analytics(
+    period: str = Query(default="7d"),
+):
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, indexer.get_tool_analytics, period
+    )
+    return data
+
+
+# ─── API Routes: Reindex ─────────────────────────────────────────────────────
+
+
+@app.post("/api/reindex")
+async def api_reindex():
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, indexer.reindex_all, True)
+    return {"status": "ok", **result}
+
+
+# ─── WebSocket Terminal (preserved from v0.5) ────────────────────────────────
+
+
 @app.websocket("/api/terminal/{session_id}")
-async def terminal_websocket(websocket: WebSocket, session_id: str, mode: str = Query(default="interactive")):
+async def terminal_websocket(
+    websocket: WebSocket,
+    session_id: str,
+    mode: str = Query(default="interactive"),
+):
     tmux_name = f"{SESSION_PREFIX}{session_id}"
-    
+
     if not tmux_session_exists(tmux_name):
         await websocket.close(code=4004, reason="Session not found")
         return
-    
+
     await websocket.accept()
     read_only = (mode == "spectator")
-    
+
     master_fd, slave_fd = pty.openpty()
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-    
+
     env = os.environ.copy()
     env["TERM"] = "xterm-256color"
-    
+
     attach_cmd = ["tmux", "attach-session", "-t", tmux_name]
     if read_only:
         attach_cmd.append("-r")
-    
-    process = subprocess.Popen(attach_cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, env=env, preexec_fn=os.setsid)
+
+    process = subprocess.Popen(
+        attach_cmd,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        preexec_fn=os.setsid,
+    )
     os.close(slave_fd)
-    
+
     async def read_pty():
         while True:
             try:
@@ -356,9 +379,9 @@ async def terminal_websocket(websocket: WebSocket, session_id: str, mode: str = 
                     continue
                 except OSError:
                     break
-            except:
+            except Exception:
                 break
-    
+
     async def write_pty():
         try:
             while True:
@@ -384,36 +407,50 @@ async def terminal_websocket(websocket: WebSocket, session_id: str, mode: str = 
                             break
                 elif message["type"] == "websocket.disconnect":
                     break
-        except:
+        except Exception:
             pass
-    
+
     read_task = asyncio.create_task(read_pty())
     write_task = asyncio.create_task(write_pty())
-    
+
     try:
-        await asyncio.wait([read_task, write_task], return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait(
+            [read_task, write_task], return_when=asyncio.FIRST_COMPLETED
+        )
         for task in [read_task, write_task]:
             task.cancel()
-    except:
+    except Exception:
         pass
     finally:
         try:
             os.close(master_fd)
-        except:
+        except Exception:
             pass
         try:
             process.terminate()
             process.wait(timeout=2)
-        except:
+        except Exception:
             pass
 
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# ─── Static files mount (must be last) ───────────────────────────────────────
+
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
     if not shutil.which("tmux"):
-        print("ERROR: tmux is required")
-        exit(1)
-    print(f"Starting Claude Remote on http://0.0.0.0:{DEFAULT_PORT}")
+        print("WARNING: tmux not found - terminal features will be unavailable")
+
+    print(f"Starting Claude Remote v2.0 on http://0.0.0.0:{DEFAULT_PORT}")
     uvicorn.run(app, host="0.0.0.0", port=DEFAULT_PORT)
