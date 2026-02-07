@@ -95,6 +95,15 @@ CREATE TABLE IF NOT EXISTS index_meta (
     indexed_at     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    endpoint       TEXT UNIQUE,
+    p256dh_key     TEXT,
+    auth_key       TEXT,
+    user_agent     TEXT,
+    created_at     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_message DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_dir);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq_num);
@@ -1286,6 +1295,51 @@ def get_tool_analytics(period: str = "7d") -> dict:
         "period": period,
         "tools": tools,
     }
+
+
+def save_push_subscription(endpoint: str, p256dh: str, auth: str, user_agent: str = "") -> bool:
+    """Store a push notification subscription."""
+    conn = _get_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO push_subscriptions
+               (endpoint, p256dh_key, auth_key, user_agent, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (endpoint, p256dh, auth, user_agent, now_iso)
+        )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def get_push_subscriptions() -> list[dict]:
+    """Get all push subscriptions."""
+    conn = _get_db()
+    rows = conn.execute("SELECT endpoint, p256dh_key, auth_key FROM push_subscriptions").fetchall()
+    conn.close()
+    return [{"endpoint": r["endpoint"], "p256dh": r["p256dh_key"], "auth": r["auth_key"]} for r in rows]
+
+
+def delete_push_subscription(endpoint: str):
+    """Remove a stale push subscription."""
+    conn = _get_db()
+    conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
+    conn.commit()
+    conn.close()
+
+
+def get_session_working_dir(session_id: str) -> Optional[str]:
+    """Look up a session's working directory from the index."""
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT working_dir FROM sessions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    conn.close()
+    return row["working_dir"] if row else None
 
 
 if __name__ == "__main__":

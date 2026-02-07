@@ -5,6 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Claude Remote</title>
 
+    <!-- PWA -->
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="theme-color" content="#f97316">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Claude Remote">
+    <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+
     <!-- xterm.js -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
@@ -34,7 +42,7 @@
             </a>
         </div>
         <nav id="mainNav">
-            <a href="#/" data-view="dashboard" class="nav-link active">Dashboard</a>
+            <a href="#/" data-view="dashboard" class="nav-link active">Dashboard <span id="needsInputBadge" class="needs-input-badge" style="display:none">0</span></a>
             <a href="#/search" data-view="search" class="nav-link">Search</a>
             <a href="#/analytics" data-view="analytics" class="nav-link">Analytics</a>
         </nav>

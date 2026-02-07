@@ -119,6 +119,24 @@ input { font-family: inherit; }
     background: var(--primary-bg);
     color: var(--primary) !important;
 }
+
+/* Needs-input notification badge */
+.needs-input-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: var(--danger);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    margin-left: 4px;
+    animation: pulse-dot 1.5s ease-in-out infinite;
+}
 .header-right {
     display: flex;
     align-items: center;
@@ -399,6 +417,15 @@ input { font-family: inherit; }
     gap: 6px;
     font-size: 12px;
     font-weight: 500;
+}
+.join-session-btn {
+    margin-left: 8px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+.join-session-btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
 }
 .session-meta-row {
     display: flex;

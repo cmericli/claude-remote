@@ -16,7 +16,8 @@ CR.state = {
     ws: null,
     term: null,
     fitAddon: null,
-    refreshInterval: null
+    refreshInterval: null,
+    needsInputSessions: new Set()
 };
 
 // --------------- API Client ---------------
@@ -97,6 +98,12 @@ CR.api = {
     },
     reindex() {
         return this._post('/api/reindex');
+    },
+    joinSession(sessionId) {
+        return this._post('/api/sessions/' + encodeURIComponent(sessionId) + '/join');
+    },
+    injectTerminal(sessionId, text) {
+        return this._post('/api/terminal/' + encodeURIComponent(sessionId) + '/inject', { text: text });
     }
 };
 
@@ -150,6 +157,17 @@ CR.router = {
         // Disconnect terminal if leaving session view
         if (viewName !== 'session' && CR.state.ws) {
             CR.terminal.disconnect();
+        }
+
+        // Manage SSE connections
+        if (viewName === 'dashboard') {
+            CR.sse.connectDashboard();
+            CR.sse.disconnectSession();
+        } else if (viewName === 'session' && CR.state.currentSessionId) {
+            CR.sse.connectSession(CR.state.currentSessionId);
+            // Keep dashboard SSE running for badge updates
+        } else {
+            CR.sse.disconnectSession();
         }
 
         // Toggle view visibility
@@ -322,6 +340,207 @@ CR.modal = {
     }
 };
 
+// --------------- SSE (Server-Sent Events) ---------------
+CR.sse = {
+    _dashboardSource: null,
+    _sessionSource: null,
+    _reconnectTimeout: null,
+    _currentSessionId: null,
+
+    connectDashboard() {
+        if (this._dashboardSource) return; // already connected
+        try {
+            this._dashboardSource = new EventSource('/api/dashboard/stream');
+            this._dashboardSource.addEventListener('new_message', function(e) {
+                try {
+                    var event = JSON.parse(e.data);
+                    if (CR.state.currentView === 'dashboard' && CR.dashboard.updateSessionCard) {
+                        CR.dashboard.updateSessionCard(event.session_id, event);
+                    }
+                } catch (err) { console.debug('SSE parse error:', err); }
+            });
+            this._dashboardSource.addEventListener('needs_input', function(e) {
+                try {
+                    var event = JSON.parse(e.data);
+                    CR.state.needsInputSessions.add(event.session_id);
+                    CR.sse._updateBadge();
+                    CR.notifications.show('Session needs input', event.session_id.substring(0, 8) + '...', event.session_id);
+                } catch (err) { console.debug('SSE parse error:', err); }
+            });
+            this._dashboardSource.onerror = function() {
+                CR.sse._closeDashboard();
+                CR.sse._reconnectTimeout = setTimeout(function() {
+                    if (CR.state.currentView === 'dashboard' || CR.state.currentView === 'session') {
+                        CR.sse.connectDashboard();
+                    }
+                }, 5000);
+            };
+        } catch (err) {
+            console.warn('SSE dashboard connect failed:', err);
+        }
+    },
+
+    _closeDashboard() {
+        if (this._dashboardSource) {
+            this._dashboardSource.close();
+            this._dashboardSource = null;
+        }
+    },
+
+    connectSession(sessionId) {
+        if (this._currentSessionId === sessionId && this._sessionSource) return;
+        this.disconnectSession();
+        this._currentSessionId = sessionId;
+        // Clear needs_input for this session since user is viewing it
+        CR.state.needsInputSessions.delete(sessionId);
+        this._updateBadge();
+
+        try {
+            this._sessionSource = new EventSource('/api/sessions/' + encodeURIComponent(sessionId) + '/stream');
+            this._sessionSource.addEventListener('new_message', function(e) {
+                try {
+                    var event = JSON.parse(e.data);
+                    if (CR.conversation.appendMessage) {
+                        CR.conversation.appendMessage(event);
+                    }
+                } catch (err) { console.debug('SSE session parse error:', err); }
+            });
+            this._sessionSource.addEventListener('needs_input', function(e) {
+                // User is already viewing this session, no notification needed
+            });
+            this._sessionSource.onerror = function() {
+                CR.sse.disconnectSession();
+                setTimeout(function() {
+                    if (CR.state.currentView === 'session' && CR.state.currentSessionId === sessionId) {
+                        CR.sse.connectSession(sessionId);
+                    }
+                }, 5000);
+            };
+        } catch (err) {
+            console.warn('SSE session connect failed:', err);
+        }
+    },
+
+    disconnectSession() {
+        if (this._sessionSource) {
+            this._sessionSource.close();
+            this._sessionSource = null;
+        }
+        this._currentSessionId = null;
+    },
+
+    disconnectAll() {
+        this._closeDashboard();
+        this.disconnectSession();
+        if (this._reconnectTimeout) {
+            clearTimeout(this._reconnectTimeout);
+            this._reconnectTimeout = null;
+        }
+    },
+
+    _updateBadge() {
+        var badge = document.getElementById('needsInputBadge');
+        var count = CR.state.needsInputSessions.size;
+        if (badge) {
+            badge.textContent = String(count);
+            badge.style.display = count > 0 ? 'inline-flex' : 'none';
+        }
+    }
+};
+
+// --------------- Browser Notifications ---------------
+CR.notifications = {
+    _permitted: false,
+
+    requestPermission() {
+        if (!('Notification' in window)) return;
+        if (Notification.permission === 'granted') {
+            this._permitted = true;
+            return;
+        }
+        if (Notification.permission !== 'denied') {
+            Notification.requestPermission().then(function(perm) {
+                CR.notifications._permitted = (perm === 'granted');
+            });
+        }
+    },
+
+    show(title, body, sessionId) {
+        if (!this._permitted || !('Notification' in window)) return;
+        if (document.hasFocus()) return; // Don't notify if window is focused
+        try {
+            var n = new Notification(title, {
+                body: body,
+                icon: '/static/icons/icon-192.png',
+                tag: 'claude-remote-' + (sessionId || ''),
+                renotify: true
+            });
+            n.onclick = function() {
+                window.focus();
+                if (sessionId) CR.navigate('#/session/' + sessionId);
+                n.close();
+            };
+        } catch (err) {
+            console.debug('Notification error:', err);
+        }
+    }
+};
+
+// --------------- Push Notifications (PWA) ---------------
+CR.push = {
+    _swRegistration: null,
+
+    registerServiceWorker() {
+        if (!('serviceWorker' in navigator)) return;
+        navigator.serviceWorker.register('/static/sw.js').then(function(reg) {
+            CR.push._swRegistration = reg;
+            console.log('Service worker registered');
+        }).catch(function(err) {
+            console.debug('SW registration failed:', err);
+        });
+    },
+
+    async subscribe() {
+        if (!this._swRegistration) return;
+        try {
+            // Get VAPID public key from server
+            var res = await fetch('/api/push/vapid-key');
+            if (!res.ok) return;
+            var data = await res.json();
+            var vapidKey = data.public_key;
+            if (!vapidKey) return;
+
+            // Convert VAPID key
+            var key = this._urlBase64ToUint8Array(vapidKey);
+            var subscription = await this._swRegistration.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: key
+            });
+
+            // Send subscription to server
+            await fetch('/api/push/subscribe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(subscription.toJSON())
+            });
+            console.log('Push subscription registered');
+        } catch (err) {
+            console.debug('Push subscribe error:', err);
+        }
+    },
+
+    _urlBase64ToUint8Array(base64String) {
+        var padding = '='.repeat((4 - base64String.length % 4) % 4);
+        var base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+        var raw = window.atob(base64);
+        var arr = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) {
+            arr[i] = raw.charCodeAt(i);
+        }
+        return arr;
+    }
+};
+
 // --------------- Init ---------------
 document.addEventListener('DOMContentLoaded', function() {
     // Mobile menu
@@ -364,6 +583,12 @@ document.addEventListener('DOMContentLoaded', function() {
     if (modalCreate) modalCreate.addEventListener('click', CR.modal.create);
     if (modalOverlay) modalOverlay.addEventListener('click', CR.modal.close);
 
-    // Start router
+    // Request notification permission
+    CR.notifications.requestPermission();
+
+    // Register service worker
+    CR.push.registerServiceWorker();
+
+    // Start router (which will also connect SSE)
     CR.router.init();
 });

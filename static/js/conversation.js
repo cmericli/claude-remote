@@ -108,6 +108,16 @@ CR.conversation = {
         html += '<span class="status-dot ' + statusClass + '"></span>';
         html += '<span>' + statusLabel + '</span>';
         html += '</span>';
+
+        // Join/Resume button
+        if (isRunning && s.is_in_tmux) {
+            html += '<button class="btn btn-success btn-sm join-session-btn" data-action="join-session" data-sid="' + CR.escapeHtml(s.session_id) + '">Attach</button>';
+        } else if (isRunning) {
+            html += '<button class="btn btn-warning btn-sm join-session-btn" data-action="join-session" data-sid="' + CR.escapeHtml(s.session_id) + '">Take Over</button>';
+        } else {
+            html += '<button class="btn btn-info btn-sm join-session-btn" data-action="join-session" data-sid="' + CR.escapeHtml(s.session_id) + '">Resume</button>';
+        }
+
         html += '</div>';
 
         html += '<div class="session-meta-row">';
@@ -382,6 +392,18 @@ CR.conversation = {
     },
 
     _bindEvents(panel) {
+        // Join session button (lives in header, outside panel)
+        var header = document.getElementById('session-header');
+        if (header) {
+            header.addEventListener('click', function(e) {
+                var joinBtn = e.target.closest('[data-action="join-session"]');
+                if (joinBtn) {
+                    var sid = joinBtn.dataset.sid;
+                    if (sid) CR.conversation._joinSession(sid);
+                }
+            });
+        }
+
         // Toggle thinking blocks
         panel.addEventListener('click', function(e) {
             var thinkBtn = e.target.closest('[data-action="toggle-thinking"]');
@@ -460,18 +482,67 @@ CR.conversation = {
     },
 
     _sendQuickAction(text) {
-        // Attempt to inject text via terminal API or navigate to terminal
+        // Attempt to inject text via terminal API
         var sessionId = CR.state.currentSessionId;
         if (!sessionId) return;
 
-        // Try the inject endpoint
-        fetch('/api/terminal/' + encodeURIComponent(sessionId) + '/inject', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: text + '\n' })
-        }).catch(function(err) {
+        CR.api.injectTerminal(sessionId, text).catch(function(err) {
             console.warn('Inject failed, switching to terminal:', err);
             CR.navigate('#/session/' + sessionId + '/terminal');
         });
+    },
+
+    appendMessage(event) {
+        // Append a live SSE message to the conversation without full re-render
+        if (!this._messageContainer) return;
+        if (!event || !event.preview) return;
+
+        var role = event.role || 'assistant';
+        var msg = {
+            uuid: 'live-' + Date.now(),
+            role: role,
+            content_text: event.preview,
+            timestamp: event.timestamp || new Date().toISOString(),
+            tool_uses: event.tool_uses ? event.tool_uses.map(function(name) {
+                return { name: name, summary: '' };
+            }) : []
+        };
+
+        var html = this._renderMessage(msg);
+        if (!html) return;
+
+        // Check if user is scrolled to bottom before appending
+        var container = this._messageContainer;
+        var atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
+
+        var div = document.createElement('div');
+        div.innerHTML = html;
+        while (div.firstChild) {
+            container.appendChild(div.firstChild);
+        }
+
+        // Auto-scroll only if user was at the bottom
+        if (atBottom) {
+            container.scrollTop = container.scrollHeight;
+        }
+    },
+
+    async _joinSession(sessionId) {
+        // Find the join button and show loading state
+        var btn = document.querySelector('[data-action="join-session"]');
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Joining...';
+        }
+        try {
+            var result = await CR.api.joinSession(sessionId);
+            CR.navigate('#/session/' + result.tmux_id + '/terminal');
+        } catch (err) {
+            console.error('Join session failed:', err);
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Retry';
+            }
+        }
     }
 };

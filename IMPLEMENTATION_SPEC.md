@@ -1,6 +1,8 @@
-# Claude Remote v2.0 - Implementation Specification
+# Claude Remote v3.0 - Implementation Specification
 
 This is the shared contract between backend and frontend. Both must adhere to these interfaces exactly.
+
+**v3.0 additions:** Join Session, Live SSE Streaming, PWA + Push Notifications.
 
 ## 1. File Structure
 
@@ -372,6 +374,144 @@ Force a full reindex.
 {"status": "ok", "sessions_indexed": 119, "messages_indexed": 8500, "duration_ms": 2500}
 ```
 
+### POST /api/sessions/{session_id}/join (v3.0)
+Join or resume a session. Creates tmux if needed.
+```json
+// Request: no body required
+
+// Response (session stopped → created new tmux):
+{"action": "created", "tmux_session": "claude-remote-abc12", "tmux_id": "abc12"}
+
+// Response (already in tmux → attach):
+{"action": "attached", "tmux_session": "claude-remote-abc12", "tmux_id": "abc12"}
+
+// Response (running but not in tmux):
+{"action": "running_no_tmux", "message": "Session is running in a terminal outside tmux"}
+
+// 404 if session not found
+```
+
+### POST /api/terminal/{session_id}/inject (v3.0)
+Send text to a session's tmux terminal (for quick actions).
+```json
+// Request:
+{"text": "yes, continue"}
+
+// Response:
+{"status": "ok"}
+
+// 404 if no tmux session found for this session
+```
+
+### GET /api/sessions/{session_id}/stream (v3.0 - SSE)
+Server-Sent Events stream for a single session.
+```
+// Event types:
+data: {"type": "new_message", "session_id": "uuid", "role": "assistant", "preview": "Let me check...", "timestamp": "..."}
+data: {"type": "tool_use", "session_id": "uuid", "tool_name": "Read", "summary": "server.py"}
+data: {"type": "status_change", "session_id": "uuid", "status": "completed"}
+
+// 30-second keepalive:
+: heartbeat
+
+// Max 5 concurrent SSE connections. Oldest dropped when limit hit.
+```
+
+### GET /api/dashboard/stream (v3.0 - SSE)
+Server-Sent Events stream for dashboard-wide updates.
+```
+// Event types:
+data: {"type": "new_message", "session_id": "uuid", "preview": "...", "timestamp": "..."}
+data: {"type": "session_started", "session_id": "uuid"}
+data: {"type": "session_completed", "session_id": "uuid"}
+data: {"type": "needs_input", "session_id": "uuid", "slug": "robust-noodling-reef", "last_message_preview": "Should I proceed?"}
+```
+
+### GET /api/needs-input (v3.0)
+Returns sessions currently waiting for user input.
+```json
+{
+  "sessions": [
+    {"session_id": "uuid", "slug": "robust-noodling-reef", "last_message_preview": "Should I proceed?", "idle_seconds": 45}
+  ]
+}
+```
+
+### GET /api/push/vapid-key (v3.0)
+Returns VAPID public key for push subscription.
+```json
+{"vapid_key": "BLxxxxxxx...base64url"}
+```
+
+### POST /api/push/subscribe (v3.0)
+Store a push notification subscription.
+```json
+// Request:
+{
+  "endpoint": "https://fcm.googleapis.com/fcm/send/...",
+  "keys": {
+    "p256dh": "BNxxxx...",
+    "auth": "xxxx..."
+  }
+}
+
+// Response:
+{"status": "ok"}
+```
+
+## 4b. SQLite Schema Additions (v3.0)
+
+```sql
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    endpoint       TEXT UNIQUE NOT NULL,
+    p256dh_key     TEXT NOT NULL,
+    auth_key       TEXT NOT NULL,
+    user_agent     TEXT,
+    created_at     TEXT  -- ISO8601
+);
+```
+
+## 4c. EventBus Architecture (v3.0)
+
+```python
+class EventBus:
+    """Async pub/sub for SSE streaming."""
+    # Topics: session_id strings for per-session, "__global__" for dashboard
+    # subscribe(topic) → asyncio.Queue
+    # unsubscribe(topic, queue)
+    # publish(topic, event_dict) → fans out to all subscribers
+
+# Background tasks (started in lifespan):
+# 1. _periodic_reindex() — every 60s, runs indexer
+# 2. _jsonl_watcher() — stat-polls JSONL files every 2s, emits events on change
+# 3. _needs_input_detector() — every 15s, checks for stale assistant messages
+```
+
+## 4d. JSONL File Watcher (v3.0)
+
+```python
+# Watches ~/.claude/projects/ for JSONL file changes
+# Uses stat-polling (not inotify/kqueue) for FUSE compatibility
+# Tracks file sizes in memory, reads only new bytes
+# Parses new JSONL lines, extracts role/preview/tool_name
+# Publishes events to EventBus (session-specific + __global__)
+# 500ms batch window to avoid flooding during rapid tool use
+# Detects FUSE mounts via path heuristic (/Google, /CloudStorage)
+```
+
+## 4e. Push Notification Pipeline (v3.0)
+
+```python
+# VAPID keys: generated on first run, stored at ~/.claude-remote/vapid_keys.json
+# Triggered by needs_input_detector when session idle >30s after assistant message
+# Rate limits:
+#   - Per session: 5-minute cooldown (PUSH_RATE_LIMIT_SEC = 300)
+#   - Global: 10 per hour (PUSH_GLOBAL_LIMIT_HOUR = 10)
+# Stale subscriptions auto-cleaned on 410 Gone response
+# Uses pywebpush library for Web Push protocol
+```
+
 ## 5. Frontend Architecture
 
 ### Global Namespace
@@ -400,7 +540,8 @@ CR.state = {
     isConnected: false,
     ws: null,
     term: null,
-    fitAddon: null
+    fitAddon: null,
+    needsInputSessions: new Set()  // v3.0: sessions needing user input
 };
 ```
 
@@ -416,8 +557,44 @@ CR.api = {
     getToolAnalytics(period) → fetch('/api/analytics/tools?...'),
     createSession(opts) → fetch('/api/sessions', POST),
     deleteSession(id) → fetch('/api/sessions/{id}', DELETE),
-    reindex() → fetch('/api/reindex', POST)
+    reindex() → fetch('/api/reindex', POST),
+    joinSession(id) → fetch('/api/sessions/{id}/join', POST),        // v3.0
+    injectTerminal(id, text) → fetch('/api/terminal/{id}/inject', POST)  // v3.0
 };
+```
+
+### SSE Client (app.js, v3.0)
+```javascript
+CR.sse = {
+    _dashboardSource: null,   // EventSource for dashboard stream
+    _sessionSource: null,     // EventSource for per-session stream
+    _reconnectTimer: null,
+
+    connectDashboard(),       // GET /api/dashboard/stream → routes to dashboard.updateSessionCard()
+    connectSession(id),       // GET /api/sessions/{id}/stream → routes to conversation.appendMessage()
+    disconnectSession(),      // Close per-session EventSource
+    _updateBadge()           // Update needsInputBadge count in nav
+};
+// Auto-reconnect on error with 5-second delay
+// Router calls connectDashboard() on dashboard view, connectSession() on session view
+```
+
+### Notifications (app.js, v3.0)
+```javascript
+CR.notifications = {
+    requestPermission(),     // Notification.requestPermission()
+    show(title, body, sessionId)  // new Notification() with click → navigate
+};
+// Only fires if document is not focused
+```
+
+### Push Subscription (app.js, v3.0)
+```javascript
+CR.push = {
+    async init(),            // Register SW, subscribe to push, send to server
+    _urlBase64ToUint8Array(base64String)  // VAPID key conversion helper
+};
+// Flow: register SW → get VAPID key → PushManager.subscribe → POST /api/push/subscribe
 ```
 
 ### Router (app.js)

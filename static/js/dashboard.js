@@ -247,6 +247,26 @@ CR.dashboard = {
         }
     },
 
+    updateSessionCard(sessionId, event) {
+        // Update a specific session card in-place from an SSE event
+        var card = document.querySelector('.session-card[data-session-id="' + sessionId + '"]');
+        if (card) {
+            // Update preview text
+            var preview = card.querySelector('.session-card-preview');
+            if (preview && event.preview) {
+                var text = event.preview;
+                if (text.length > 80) text = text.substring(0, 80) + '...';
+                preview.textContent = text;
+            }
+            // Flash the card border to indicate activity
+            card.style.borderColor = 'var(--primary)';
+            setTimeout(function() { card.style.borderColor = ''; }, 2000);
+        } else {
+            // Card doesn't exist (new session or not visible) — trigger silent refresh
+            this.render(true);
+        }
+    },
+
     _bindEvents(container) {
         // Delegate clicks on session cards and action buttons
         container.addEventListener('click', function(e) {
