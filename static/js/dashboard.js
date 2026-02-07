@@ -120,10 +120,14 @@ CR.dashboard = {
         var tokens = CR.formatTokens(s.total_tokens);
         var sessionId = s.session_id;
 
-        var html = '<div class="session-card" data-session-id="' + CR.escapeHtml(sessionId) + '" data-action="open">';
+        var hostname = s.hostname || '';
+        var html = '<div class="session-card" data-session-id="' + CR.escapeHtml(sessionId) + '" data-hostname="' + CR.escapeHtml(hostname) + '" data-action="open">';
         html += '<div class="session-card-header">';
         html += '<span class="status-dot ' + statusClass + '"></span>';
         html += '<span class="session-card-project">' + CR.escapeHtml(project) + '</span>';
+        if (CR.state.coordinatorMode && s.hostname) {
+            html += '<span class="badge badge-machine">' + CR.escapeHtml(s.hostname) + '</span>';
+        }
         if (s.is_in_tmux) {
             html += '<span class="badge badge-success">tmux</span>';
         }
@@ -145,11 +149,11 @@ CR.dashboard = {
         html += '<span>' + tokens + ' tokens</span>';
         html += '</div>';
         html += '<div class="session-card-actions">';
-        html += '<button class="btn btn-info btn-sm" data-action="view" data-sid="' + CR.escapeHtml(sessionId) + '">View</button>';
+        html += '<button class="btn btn-info btn-sm" data-action="view" data-sid="' + CR.escapeHtml(sessionId) + '" data-hostname="' + CR.escapeHtml(hostname) + '">View</button>';
         if (s.is_running && s.is_in_tmux) {
-            html += '<button class="btn btn-success btn-sm" data-action="attach" data-sid="' + CR.escapeHtml(sessionId) + '">Attach</button>';
+            html += '<button class="btn btn-success btn-sm" data-action="attach" data-sid="' + CR.escapeHtml(sessionId) + '" data-hostname="' + CR.escapeHtml(hostname) + '">Attach</button>';
         } else if (s.is_running) {
-            html += '<button class="btn btn-ghost btn-sm" data-action="browse" data-sid="' + CR.escapeHtml(sessionId) + '">Browse</button>';
+            html += '<button class="btn btn-ghost btn-sm" data-action="browse" data-sid="' + CR.escapeHtml(sessionId) + '" data-hostname="' + CR.escapeHtml(hostname) + '">Browse</button>';
         }
         html += '</div>';
         html += '</div>';
@@ -172,11 +176,15 @@ CR.dashboard = {
         var project = item.project || CR.projectName(item.slug);
         var time = CR.formatTimeShort(item.timestamp);
         var summary = item.summary || item.tool_name || '';
+        var hostname = item.hostname || '';
 
-        var html = '<div class="activity-item" data-session-id="' + CR.escapeHtml(item.session_id) + '" data-action="open">';
+        var html = '<div class="activity-item" data-session-id="' + CR.escapeHtml(item.session_id) + '" data-hostname="' + CR.escapeHtml(hostname) + '" data-action="open">';
         html += '<span class="activity-time">' + CR.escapeHtml(time) + '</span>';
         html += '<span class="activity-icon">' + icon + '</span>';
         html += '<span class="activity-text">';
+        if (CR.state.coordinatorMode && hostname) {
+            html += '<span class="badge badge-machine" style="margin-right:4px">' + CR.escapeHtml(hostname) + '</span>';
+        }
         html += '<span class="activity-project">' + CR.escapeHtml(project) + '</span> ';
         html += CR.escapeHtml(summary);
         html += '</span>';
@@ -221,16 +229,20 @@ CR.dashboard = {
             for (var i = 0; i < data.sessions.length; i++) {
                 var s = data.sessions[i];
                 var project = s.project || CR.projectName(s.working_dir);
-                html += '<div class="history-item" data-session-id="' + CR.escapeHtml(s.session_id) + '" data-action="open">';
+                var hostname = s.hostname || '';
+                html += '<div class="history-item" data-session-id="' + CR.escapeHtml(s.session_id) + '" data-hostname="' + CR.escapeHtml(hostname) + '" data-action="open">';
                 html += '<span class="status-dot ' + (s.is_running ? 'running' : 'stopped') + '"></span>';
                 html += '<span class="history-slug">' + CR.escapeHtml(s.slug || s.session_id.substring(0, 8)) + '</span>';
+                if (CR.state.coordinatorMode && hostname) {
+                    html += '<span class="badge badge-machine">' + CR.escapeHtml(hostname) + '</span>';
+                }
                 html += '<span class="history-project badge badge-dim">' + CR.escapeHtml(project) + '</span>';
                 html += '<span class="history-time">' + CR.formatTime(s.last_message) + '</span>';
                 if (s.file_size_mb) {
                     html += '<span style="font-size:12px;color:var(--text-dim);min-width:50px;text-align:right">' +
                         Number(s.file_size_mb).toFixed(1) + 'MB</span>';
                 }
-                html += '<button class="btn btn-ghost btn-sm" data-action="browse" data-sid="' + CR.escapeHtml(s.session_id) + '">Browse</button>';
+                html += '<button class="btn btn-ghost btn-sm" data-action="browse" data-sid="' + CR.escapeHtml(s.session_id) + '" data-hostname="' + CR.escapeHtml(hostname) + '">Browse</button>';
                 html += '</div>';
             }
 
@@ -276,10 +288,11 @@ CR.dashboard = {
                 e.stopPropagation();
                 var action = actionBtn.dataset.action;
                 var sid = actionBtn.dataset.sid;
+                var host = actionBtn.dataset.hostname || '';
                 if (action === 'view' || action === 'browse' || action === 'open') {
-                    CR.navigate('#/session/' + sid);
+                    CR.navigate(CR.sessionUrl(sid, host));
                 } else if (action === 'attach') {
-                    CR.navigate('#/session/' + sid + '/terminal');
+                    CR.navigate(CR.sessionUrl(sid, host, 'terminal'));
                 }
                 return;
             }
@@ -287,7 +300,7 @@ CR.dashboard = {
             // Check for card click
             var card = e.target.closest('[data-session-id][data-action="open"]');
             if (card) {
-                CR.navigate('#/session/' + card.dataset.sessionId);
+                CR.navigate(CR.sessionUrl(card.dataset.sessionId, card.dataset.hostname || ''));
             }
         });
     },
@@ -297,12 +310,12 @@ CR.dashboard = {
             var actionBtn = e.target.closest('[data-action][data-sid]');
             if (actionBtn) {
                 e.stopPropagation();
-                CR.navigate('#/session/' + actionBtn.dataset.sid);
+                CR.navigate(CR.sessionUrl(actionBtn.dataset.sid, actionBtn.dataset.hostname || ''));
                 return;
             }
             var row = e.target.closest('[data-session-id][data-action="open"]');
             if (row) {
-                CR.navigate('#/session/' + row.dataset.sessionId);
+                CR.navigate(CR.sessionUrl(row.dataset.sessionId, row.dataset.hostname || ''));
             }
         });
     }

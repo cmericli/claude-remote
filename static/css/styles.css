@@ -76,6 +76,9 @@ input { font-family: inherit; }
     align-items: center;
     justify-content: space-between;
     padding: 0 16px;
+    padding-top: env(safe-area-inset-top, 0);
+    padding-left: max(16px, env(safe-area-inset-left, 0));
+    padding-right: max(16px, env(safe-area-inset-right, 0));
     flex-shrink: 0;
     z-index: 50;
 }
@@ -141,6 +144,24 @@ input { font-family: inherit; }
     display: flex;
     align-items: center;
     gap: 12px;
+}
+.machine-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.machine-indicator {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.machine-name {
+    max-width: 80px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .header-status {
     display: flex;
@@ -215,6 +236,9 @@ input { font-family: inherit; }
     align-items: center;
     gap: 8px;
     padding: 0 16px;
+    padding-bottom: env(safe-area-inset-bottom, 0);
+    padding-left: max(16px, env(safe-area-inset-left, 0));
+    padding-right: max(16px, env(safe-area-inset-right, 0));
     font-size: 12px;
     color: var(--text-secondary);
     flex-shrink: 0;
@@ -973,6 +997,7 @@ input { font-family: inherit; }
 .badge-warning { background: var(--warning-bg); color: var(--warning); }
 .badge-info { background: var(--info-bg); color: var(--info); }
 .badge-dim { background: var(--bg-raised); color: var(--text-dim); }
+.badge-machine { background: var(--secondary-bg); color: var(--secondary); }
 
 /* --- Modal --- */
 .modal {
@@ -1140,6 +1165,7 @@ input { font-family: inherit; }
     }
 
     .header-status .status-label { display: none; }
+    .machine-status { display: none; }
 }
 
 @media (min-width: 769px) and (max-width: 1024px) {

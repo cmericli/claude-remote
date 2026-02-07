@@ -1,5 +1,5 @@
 /* ============================================================
-   Claude Remote v2.0 - Core Application
+   Claude Remote v4.0 - Core Application
    State management, API client, router, utilities
    ============================================================ */
 
@@ -9,6 +9,7 @@ window.CR = window.CR || {};
 CR.state = {
     currentView: 'dashboard',
     currentSessionId: null,
+    currentSessionHostname: null,
     currentSessionTab: 'conversation',
     sessions: [],
     dashboardData: null,
@@ -17,7 +18,11 @@ CR.state = {
     term: null,
     fitAddon: null,
     refreshInterval: null,
-    needsInputSessions: new Set()
+    needsInputSessions: new Set(),
+    // Multi-machine
+    coordinatorMode: false,
+    localHostname: '',
+    machines: []
 };
 
 // --------------- API Client ---------------
@@ -43,16 +48,19 @@ CR.api = {
     },
 
     getDashboard() {
-        return this._fetch('/api/dashboard');
+        var prefix = CR.state.coordinatorMode ? '/api/multi' : '/api';
+        return this._fetch(prefix + '/dashboard');
     },
     getSessions(params = {}) {
+        var prefix = CR.state.coordinatorMode ? '/api/multi' : '/api';
         const q = new URLSearchParams();
         if (params.status) q.set('status', params.status);
         if (params.project) q.set('project', params.project);
+        if (params.hostname) q.set('hostname', params.hostname);
         if (params.limit) q.set('limit', params.limit);
         if (params.offset) q.set('offset', params.offset);
         const qs = q.toString();
-        return this._fetch('/api/sessions' + (qs ? '?' + qs : ''));
+        return this._fetch(prefix + '/sessions' + (qs ? '?' + qs : ''));
     },
     getSession(id) {
         return this._fetch('/api/sessions/' + encodeURIComponent(id));
@@ -65,13 +73,14 @@ CR.api = {
         return this._fetch('/api/sessions/' + encodeURIComponent(id) + '/conversation' + (qs ? '?' + qs : ''));
     },
     search(query, filters = {}) {
+        var prefix = CR.state.coordinatorMode ? '/api/multi' : '/api';
         const q = new URLSearchParams();
         q.set('q', query);
         if (filters.project) q.set('project', filters.project);
         if (filters.after) q.set('after', filters.after);
         if (filters.before) q.set('before', filters.before);
         if (filters.limit) q.set('limit', filters.limit);
-        return this._fetch('/api/search?' + q.toString());
+        return this._fetch(prefix + '/search?' + q.toString());
     },
     getTokenAnalytics(period, groupBy) {
         const q = new URLSearchParams();
@@ -99,11 +108,20 @@ CR.api = {
     reindex() {
         return this._post('/api/reindex');
     },
-    joinSession(sessionId) {
+    joinSession(sessionId, hostname) {
+        if (CR.state.coordinatorMode && hostname && hostname !== CR.state.localHostname) {
+            return this._post('/api/multi/sessions/' + encodeURIComponent(hostname) + '/' + encodeURIComponent(sessionId) + '/join');
+        }
         return this._post('/api/sessions/' + encodeURIComponent(sessionId) + '/join');
     },
-    injectTerminal(sessionId, text) {
+    injectTerminal(sessionId, text, hostname) {
+        if (CR.state.coordinatorMode && hostname && hostname !== CR.state.localHostname) {
+            return this._post('/api/multi/terminal/' + encodeURIComponent(hostname) + '/' + encodeURIComponent(sessionId) + '/inject', { text: text });
+        }
         return this._post('/api/terminal/' + encodeURIComponent(sessionId) + '/inject', { text: text });
+    },
+    getMachines() {
+        return this._fetch('/api/machines');
     }
 };
 
@@ -125,9 +143,21 @@ CR.router = {
             CR.dashboard.render();
         } else if (path.startsWith('/session/')) {
             const segments = path.split('/');
-            const sessionId = segments[2];
-            const tab = segments[3] || 'conversation';
+            // Support both #/session/{id}/{tab} and #/session/{hostname}/{id}/{tab}
+            var sessionId, sessionHostname, tab;
+            if (segments.length >= 4 && segments[3] && !['conversation','terminal','files','stats'].includes(segments[3])) {
+                // Format: /session/{hostname}/{id}/{tab?}
+                sessionHostname = segments[2];
+                sessionId = segments[3];
+                tab = segments[4] || 'conversation';
+            } else {
+                // Format: /session/{id}/{tab?}
+                sessionId = segments[2];
+                sessionHostname = CR.state.localHostname || '';
+                tab = segments[3] || 'conversation';
+            }
             CR.state.currentSessionId = sessionId;
+            CR.state.currentSessionHostname = sessionHostname;
             CR.state.currentSessionTab = tab;
             this._activate('session');
             this._activateSessionTab(tab);
@@ -586,9 +616,103 @@ document.addEventListener('DOMContentLoaded', function() {
     // Request notification permission
     CR.notifications.requestPermission();
 
-    // Register service worker
+    // Register service worker (web only)
     CR.push.registerServiceWorker();
+
+    // Initialize native push (Capacitor)
+    if (CR.nativePush) CR.nativePush.init();
+
+    // Configure native platform (Capacitor)
+    if (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
+        // Status bar
+        try {
+            var StatusBar = window.Capacitor.Plugins.StatusBar;
+            if (StatusBar) {
+                StatusBar.setStyle({ style: 'DARK' });
+                StatusBar.setBackgroundColor({ color: '#0a0a0f' });
+            }
+        } catch (e) {}
+        // Keyboard
+        try {
+            var Keyboard = window.Capacitor.Plugins.Keyboard;
+            if (Keyboard) {
+                Keyboard.setAccessoryBarVisible({ isVisible: true });
+                Keyboard.setScroll({ isDisabled: false });
+            }
+        } catch (e) {}
+    }
+
+    // Detect coordinator mode and initialize machine status
+    CR.api.getMachines().then(function(data) {
+        CR.state.coordinatorMode = data.coordinator || false;
+        CR.state.machines = data.machines || [];
+        // Find local hostname
+        for (var i = 0; i < CR.state.machines.length; i++) {
+            if (!CR.state.machines[i].url) {
+                CR.state.localHostname = CR.state.machines[i].hostname;
+                break;
+            }
+        }
+        if (CR.state.coordinatorMode) {
+            CR.fleet.renderMachineStatus();
+        }
+    }).catch(function() {
+        // Not available or not coordinator — no-op
+    });
 
     // Start router (which will also connect SSE)
     CR.router.init();
 });
+
+// --------------- Fleet (Multi-Machine UI) ---------------
+CR.fleet = {
+    renderMachineStatus() {
+        var container = document.getElementById('machineStatus');
+        if (!container || !CR.state.coordinatorMode) return;
+
+        var html = '';
+        for (var i = 0; i < CR.state.machines.length; i++) {
+            var m = CR.state.machines[i];
+            var statusClass = m.status === 'ok' ? 'running' : 'stopped';
+            var name = m.hostname || m.label || 'unknown';
+            html += '<div class="machine-indicator" title="' + CR.escapeHtml(m.label || name) + '">';
+            html += '<span class="status-dot ' + statusClass + '"></span>';
+            html += '<span class="machine-name">' + CR.escapeHtml(name) + '</span>';
+            html += '</div>';
+        }
+        container.innerHTML = html;
+        container.style.display = '';
+    },
+
+    refresh() {
+        CR.api.getMachines().then(function(data) {
+            CR.state.machines = data.machines || [];
+            CR.fleet.renderMachineStatus();
+        }).catch(function() {});
+    }
+};
+
+// --------------- Haptic Feedback (Native) ---------------
+CR.haptic = function(style) {
+    if (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
+        try {
+            var Haptics = window.Capacitor.Plugins.Haptics;
+            if (Haptics) {
+                Haptics.impact({ style: style || 'MEDIUM' });
+            }
+        } catch (e) {}
+    }
+};
+
+// Helper: build session URL with optional hostname
+CR.sessionUrl = function(sessionId, hostname, tab) {
+    var path = '#/session/';
+    if (CR.state.coordinatorMode && hostname && hostname !== CR.state.localHostname) {
+        path += encodeURIComponent(hostname) + '/';
+    }
+    path += encodeURIComponent(sessionId);
+    if (tab && tab !== 'conversation') {
+        path += '/' + tab;
+    }
+    return path;
+};

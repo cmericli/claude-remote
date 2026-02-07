@@ -152,10 +152,15 @@ CR.search = {
             }
         }
 
+        var hostname = result.hostname || '';
         var html = '<div class="search-result" data-session-id="' + CR.escapeHtml(result.session_id) + '" ' +
+            'data-hostname="' + CR.escapeHtml(hostname) + '" ' +
             'data-msg-uuid="' + CR.escapeHtml(result.message_uuid || '') + '">';
         html += '<div class="search-result-header">';
         html += '<span class="search-result-slug">' + CR.escapeHtml(result.slug || '') + '</span>';
+        if (CR.state.coordinatorMode && hostname) {
+            html += '<span class="badge badge-machine">' + CR.escapeHtml(hostname) + '</span>';
+        }
         if (result.project) {
             html += '<span class="search-result-project">' + CR.escapeHtml(result.project) + '</span>';
         }
@@ -206,9 +211,10 @@ CR.search = {
             var result = e.target.closest('.search-result');
             if (result) {
                 var sid = result.dataset.sessionId;
+                var hostname = result.dataset.hostname || '';
                 var msgUuid = result.dataset.msgUuid;
                 if (sid) {
-                    var hash = '#/session/' + sid;
+                    var hash = CR.sessionUrl(sid, hostname);
                     if (msgUuid) hash += '?msg=' + msgUuid;
                     CR.navigate(hash);
                 }

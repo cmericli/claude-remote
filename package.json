@@ -1,0 +1,25 @@
+{
+  "name": "claude-remote",
+  "version": "4.0.0",
+  "description": "Claude Remote - Fleet Dashboard for Claude Code sessions",
+  "private": true,
+  "scripts": {
+    "cap:sync": "npx cap sync",
+    "cap:open": "npx cap open ios",
+    "cap:build": "npx cap sync && npx cap open ios"
+  },
+  "dependencies": {
+    "@capacitor/background-runner": "^3.0.0",
+    "@capacitor/core": "^8.0.0",
+    "@capacitor/haptics": "^8.0.0",
+    "@capacitor/ios": "^8.0.2",
+    "@capacitor/keyboard": "^8.0.0",
+    "@capacitor/push-notifications": "^8.0.0",
+    "@capacitor/splash-screen": "^8.0.0",
+    "@capacitor/status-bar": "^8.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.0.0",
+    "typescript": "^5.9.3"
+  }
+}

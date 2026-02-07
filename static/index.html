@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Claude Remote</title>
 
     <!-- PWA -->
@@ -47,6 +47,7 @@
             <a href="#/analytics" data-view="analytics" class="nav-link">Analytics</a>
         </nav>
         <div class="header-right">
+            <div id="machineStatus" class="machine-status" style="display:none"></div>
             <div class="header-status">
                 <span class="status-dot" id="headerStatusDot"></span>
                 <span class="status-label" id="headerStatusLabel">Ready</span>
@@ -123,8 +124,12 @@
         </div>
     </div>
 
+    <!-- Capacitor (only loads in native context) -->
+    <script src="https://unpkg.com/@capacitor/core@latest/dist/capacitor.js" nomodule></script>
+
     <!-- App modules (order matters) -->
     <script src="/static/js/app.js"></script>
+    <script src="/static/js/notifications.js"></script>
     <script src="/static/js/dashboard.js"></script>
     <script src="/static/js/conversation.js"></script>
     <script src="/static/js/terminal.js"></script>

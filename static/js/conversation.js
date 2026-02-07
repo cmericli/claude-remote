@@ -104,6 +104,9 @@ CR.conversation = {
         var html = '<div class="session-header-top">';
         html += '<button class="session-back-btn" onclick="CR.navigate(\'#/\')">&larr; Dashboard</button>';
         html += '<span class="session-title">' + CR.escapeHtml(s.slug || project) + '</span>';
+        if (CR.state.coordinatorMode && s.hostname) {
+            html += '<span class="badge badge-machine">' + CR.escapeHtml(s.hostname) + '</span>';
+        }
         html += '<span class="session-status-badge">';
         html += '<span class="status-dot ' + statusClass + '"></span>';
         html += '<span>' + statusLabel + '</span>';
@@ -448,7 +451,7 @@ CR.conversation = {
                 } else if (action === 'stop') {
                     // Navigate to terminal and let user Ctrl+C
                     if (CR.state.currentSessionId) {
-                        CR.navigate('#/session/' + CR.state.currentSessionId + '/terminal');
+                        CR.navigate(CR.sessionUrl(CR.state.currentSessionId, CR.state.currentSessionHostname, 'terminal'));
                     }
                 }
                 return;
@@ -484,11 +487,12 @@ CR.conversation = {
     _sendQuickAction(text) {
         // Attempt to inject text via terminal API
         var sessionId = CR.state.currentSessionId;
+        var hostname = CR.state.currentSessionHostname;
         if (!sessionId) return;
 
-        CR.api.injectTerminal(sessionId, text).catch(function(err) {
+        CR.api.injectTerminal(sessionId, text, hostname).catch(function(err) {
             console.warn('Inject failed, switching to terminal:', err);
-            CR.navigate('#/session/' + sessionId + '/terminal');
+            CR.navigate(CR.sessionUrl(sessionId, hostname, 'terminal'));
         });
     },
 
@@ -534,9 +538,12 @@ CR.conversation = {
             btn.disabled = true;
             btn.textContent = 'Joining...';
         }
+        var hostname = CR.state.currentSessionHostname;
         try {
-            var result = await CR.api.joinSession(sessionId);
-            CR.navigate('#/session/' + result.tmux_id + '/terminal');
+            var result = await CR.api.joinSession(sessionId, hostname);
+            // For remote joins, navigate with remote hostname
+            var targetHost = result.remote_hostname || hostname;
+            CR.navigate(CR.sessionUrl(result.tmux_id, targetHost, 'terminal'));
         } catch (err) {
             console.error('Join session failed:', err);
             if (btn) {

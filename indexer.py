@@ -13,6 +13,7 @@ import logging
 import os
 import platform
 import re
+import socket
 import sqlite3
 import subprocess
 import time
@@ -25,6 +26,7 @@ logger = logging.getLogger("indexer")
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 INDEX_DIR = Path.home() / ".claude-remote"
 INDEX_DB = INDEX_DIR / "index.db"
+HOSTNAME = socket.gethostname()
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -45,6 +47,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_cache_read      INTEGER DEFAULT 0,
     total_cache_create    INTEGER DEFAULT 0,
     file_size_bytes       INTEGER DEFAULT 0,
+    hostname              TEXT DEFAULT '',
     jsonl_path            TEXT,
     indexed_at            TEXT
 );
@@ -104,6 +107,12 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     created_at     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS push_devices (
+    device_token   TEXT PRIMARY KEY,
+    platform       TEXT DEFAULT 'ios',
+    registered_at  TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_message DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_dir);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq_num);
@@ -150,6 +159,19 @@ TOOL_SUMMARY_MAP = {
 }
 
 
+def _migrate_schema(conn: sqlite3.Connection):
+    """Apply safe schema migrations for new columns."""
+    migrations = [
+        ("sessions", "hostname", "TEXT DEFAULT ''"),
+    ]
+    for table, column, col_type in migrations:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            logger.info(f"Migrated: added {column} to {table}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+
 def _get_db() -> sqlite3.Connection:
     """Get a database connection, creating schema if needed."""
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
@@ -160,6 +182,8 @@ def _get_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     # Create tables
     conn.executescript(SCHEMA_SQL)
+    # Migrate existing databases
+    _migrate_schema(conn)
     # FTS table and trigger - separate because virtual tables can't be in executescript easily
     for stmt in FTS_SQL.strip().split(";"):
         stmt = stmt.strip()
@@ -457,12 +481,12 @@ def index_session(jsonl_path: str, conn: Optional[sqlite3.Connection] = None) ->
            (session_id, slug, project_dir, working_dir, git_branch, model, version,
             first_message, last_message, message_count, user_msg_count, asst_msg_count,
             total_input_tokens, total_output_tokens, total_cache_read, total_cache_create,
-            file_size_bytes, jsonl_path, indexed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            file_size_bytes, hostname, jsonl_path, indexed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (session_id, slug, project_name, working_dir, git_branch, model, version,
          first_timestamp, last_timestamp, message_count, user_msg_count, asst_msg_count,
          total_input, total_output, total_cache_read, total_cache_create,
-         stat.st_size, str(path), now_iso)
+         stat.st_size, HOSTNAME, str(path), now_iso)
     )
 
     # Batch insert messages
@@ -802,6 +826,7 @@ def get_dashboard_data(active_ids: set, tmux_ids: set) -> dict:
             "working_dir": r["working_dir"],
             "model": r["model"],
             "git_branch": r["git_branch"],
+            "hostname": r["hostname"],
             "is_running": is_running,
             "is_in_tmux": is_in_tmux,
             "last_message": r["last_message"],
@@ -814,7 +839,7 @@ def get_dashboard_data(active_ids: set, tmux_ids: set) -> dict:
     # Recent activity (last 20 tool uses across all sessions)
     recent_tools = conn.execute(
         """SELECT tu.session_id, tu.tool_name, tu.input_summary, tu.timestamp,
-                  s.slug, s.project_dir
+                  s.slug, s.project_dir, s.hostname
            FROM tool_uses tu
            JOIN sessions s ON tu.session_id = s.session_id
            ORDER BY tu.timestamp DESC LIMIT 20"""
@@ -826,6 +851,7 @@ def get_dashboard_data(active_ids: set, tmux_ids: set) -> dict:
             "session_id": r["session_id"],
             "slug": r["slug"],
             "project": r["project_dir"],
+            "hostname": r["hostname"],
             "type": "tool_use",
             "tool_name": r["tool_name"],
             "summary": r["input_summary"],
@@ -956,6 +982,7 @@ def get_sessions(active_ids: set, tmux_ids: set, status: str = "all",
             "working_dir": r["working_dir"],
             "model": r["model"],
             "git_branch": r["git_branch"],
+            "hostname": r["hostname"],
             "first_message": r["first_message"],
             "last_message": r["last_message"],
             "message_count": r["message_count"],
@@ -1005,6 +1032,7 @@ def get_session_detail(session_id: str, active_ids: set, tmux_ids: set) -> Optio
         "working_dir": row["working_dir"],
         "model": row["model"],
         "git_branch": row["git_branch"],
+        "hostname": row["hostname"],
         "first_message": row["first_message"],
         "last_message": row["last_message"],
         "message_count": row["message_count"],
@@ -1135,7 +1163,7 @@ def search(query: str, project: Optional[str] = None,
     # Join FTS results with messages and sessions
     sql = """
         SELECT m.uuid, m.session_id, m.role, m.content_text, m.timestamp, m.seq_num,
-               s.slug, s.project_dir,
+               s.slug, s.project_dir, s.hostname,
                snippet(messages_fts, 0, '>>>>', '<<<<', '...', 40) as snip
         FROM messages_fts
         JOIN messages m ON messages_fts.rowid = m.rowid
@@ -1173,6 +1201,7 @@ def search(query: str, project: Optional[str] = None,
             "session_id": r["session_id"],
             "slug": r["slug"],
             "project": r["project_dir"],
+            "hostname": r["hostname"],
             "message_uuid": r["uuid"],
             "role": r["role"],
             "snippet": snippet[:200],
@@ -1330,6 +1359,46 @@ def delete_push_subscription(endpoint: str):
     conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
     conn.commit()
     conn.close()
+
+
+def register_push_device(device_token: str, platform: str = "ios") -> bool:
+    """Register a native push device token (APNs)."""
+    conn = _get_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO push_devices
+               (device_token, platform, registered_at)
+               VALUES (?, ?, ?)""",
+            (device_token, platform, now_iso)
+        )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def unregister_push_device(device_token: str) -> bool:
+    """Remove a native push device token."""
+    conn = _get_db()
+    try:
+        conn.execute("DELETE FROM push_devices WHERE device_token = ?", (device_token,))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def get_push_devices() -> list[dict]:
+    """Get all registered native push device tokens."""
+    conn = _get_db()
+    rows = conn.execute("SELECT device_token, platform FROM push_devices").fetchall()
+    conn.close()
+    return [{"device_token": r["device_token"], "platform": r["platform"]} for r in rows]
 
 
 def get_session_working_dir(session_id: str) -> Optional[str]:

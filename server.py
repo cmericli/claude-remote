@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Remote v3.0 - The Living Dashboard for Claude Code sessions.
+Claude Remote v4.0 - Fleet Dashboard for Claude Code sessions.
 
 FastAPI server with:
 - JSONL indexing and full-text search (SQLite + FTS5)
@@ -12,8 +12,13 @@ FastAPI server with:
 - Live streaming: Server-Sent Events for real-time dashboard/conversation updates (v3.0)
 - EventBus: async pub/sub with JSONL file watcher and needs-input detection (v3.0)
 - PWA: Progressive Web App with service worker and push notifications (v3.0)
+- Multi-machine fleet: coordinator mode aggregates remote machines (v4.0)
+- WebSocket terminal proxy: access remote machine terminals (v4.0)
+- HTTPS via Tailscale: auto-discovery of TLS certificates (v4.0)
+- Native iOS app: Capacitor shell with APNs push notifications (v4.0)
 """
 
+import argparse
 import asyncio
 import fcntl
 import json
@@ -50,8 +55,39 @@ REINDEX_INTERVAL = 60  # seconds
 VAPID_KEYS_PATH = Path.home() / ".claude-remote" / "vapid_keys.json"
 PUSH_RATE_LIMIT_SEC = 300  # 5 minutes per session
 PUSH_GLOBAL_LIMIT_HOUR = 10
+MACHINES_CONFIG_PATH = Path.home() / ".claude-remote" / "machines.json"
+APNS_KEY_PATH = Path.home() / ".claude-remote" / "apns_key.p8"
+APNS_CONFIG_PATH = Path.home() / ".claude-remote" / "apns.json"
 
 logger = logging.getLogger("server")
+
+# ─── Multi-Machine Config ────────────────────────────────────────────────────
+
+# Populated at startup via argparse
+_coordinator_mode: bool = False
+_machines_config: list[dict] = []
+
+
+def _load_machines_config() -> list[dict]:
+    """Load remote machine definitions from ~/.claude-remote/machines.json."""
+    if not MACHINES_CONFIG_PATH.exists():
+        return []
+    try:
+        data = json.loads(MACHINES_CONFIG_PATH.read_text())
+        machines = data.get("machines", [])
+        # Validate each entry has required fields
+        valid = []
+        for m in machines:
+            if "url" in m:
+                valid.append({
+                    "hostname": m.get("hostname", ""),
+                    "url": m["url"].rstrip("/"),
+                    "label": m.get("label", m.get("hostname", m["url"])),
+                })
+        return valid
+    except Exception as e:
+        logger.warning(f"Failed to load machines config: {e}")
+        return []
 
 # ─── VAPID Key Management ────────────────────────────────────────────────────
 
@@ -78,11 +114,14 @@ def _init_vapid_keys():
 
     # Generate new keys
     try:
+        import base64
         from py_vapid import Vapid
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
         vapid = Vapid()
         vapid.generate_keys()
         _vapid_private_key = vapid.private_pem().decode("utf-8")
-        _vapid_public_key = vapid.public_key_urlsafe_base64()
+        raw_pub = vapid.public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        _vapid_public_key = base64.urlsafe_b64encode(raw_pub).rstrip(b"=").decode()
         VAPID_KEYS_PATH.write_text(json.dumps({
             "private_key": _vapid_private_key,
             "public_key": _vapid_public_key,
@@ -153,6 +192,71 @@ def _send_push_notification(session_id: str, title: str, body: str):
                 logger.info(f"Removed stale push subscription")
             else:
                 logger.debug(f"Push send failed: {e}")
+
+# ─── APNs Push Notifications (Native iOS) ────────────────────────────────────
+
+_apns_client = None
+
+
+def _init_apns():
+    """Initialize APNs client if config is available."""
+    global _apns_client
+    if not APNS_KEY_PATH.exists() or not APNS_CONFIG_PATH.exists():
+        return
+    try:
+        from aioapns import APNs, NotificationRequest
+        config = json.loads(APNS_CONFIG_PATH.read_text())
+        _apns_client = APNs(
+            key=str(APNS_KEY_PATH),
+            key_id=config.get("key_id", ""),
+            team_id=config.get("team_id", ""),
+            topic=config.get("bundle_id", "com.atlasrobotics.clauderemote"),
+            use_sandbox=config.get("sandbox", True),
+        )
+        logger.info("APNs client initialized")
+    except ImportError:
+        logger.debug("aioapns not installed - native push disabled")
+    except Exception as e:
+        logger.warning(f"APNs init failed: {e}")
+
+
+async def _send_apns_notification(device_token: str, title: str, body: str, data: dict = None):
+    """Send a push notification via APNs."""
+    if not _apns_client:
+        return
+    try:
+        from aioapns import NotificationRequest
+        request = NotificationRequest(
+            device_token=device_token,
+            message={
+                "aps": {
+                    "alert": {"title": title, "body": body},
+                    "sound": "default",
+                    "badge": 1,
+                },
+                **(data or {}),
+            },
+        )
+        response = await _apns_client.send_notification(request)
+        if not response.is_successful:
+            logger.debug(f"APNs send failed: {response.description}")
+            if response.description in ("Unregistered", "BadDeviceToken"):
+                indexer.unregister_push_device(device_token)
+    except Exception as e:
+        logger.debug(f"APNs send error: {e}")
+
+
+async def _send_apns_to_all(session_id: str, title: str, body: str):
+    """Send APNs push to all registered devices."""
+    if not _apns_client:
+        return
+    devices = indexer.get_push_devices()
+    for dev in devices:
+        await _send_apns_notification(
+            dev["device_token"], title, body,
+            {"session_id": session_id}
+        )
+
 
 # ─── EventBus (SSE pub/sub) ──────────────────────────────────────────────────
 
@@ -305,6 +409,7 @@ async def _jsonl_watcher():
                             event = {
                                 "type": "new_message",
                                 "session_id": session_id,
+                                "hostname": indexer.HOSTNAME,
                                 "role": role,
                                 "preview": preview,
                                 "timestamp": entry.get("timestamp", ""),
@@ -402,15 +507,20 @@ async def _needs_input_detector():
                     event = {
                         "type": "needs_input",
                         "session_id": session_id,
+                        "hostname": indexer.HOSTNAME,
                         "timestamp": datetime.utcnow().isoformat() + "Z",
                     }
                     await event_bus.publish(session_id, event)
                     await event_bus.publish_global(event)
                     _needs_input_cooldown[session_id] = now
                     logger.info(f"Session {session_id[:8]}... needs input")
-                    # Send push notification in background
+                    # Send push notifications in background (Web Push + APNs)
                     await asyncio.get_event_loop().run_in_executor(
                         None, _send_push_notification,
+                        session_id, "Session needs input",
+                        f"Session {session_id[:8]}... is waiting for your response"
+                    )
+                    await _send_apns_to_all(
                         session_id, "Session needs input",
                         f"Session {session_id[:8]}... is waiting for your response"
                     )
@@ -429,6 +539,7 @@ async def _needs_input_detector():
 # ─── Background tasks ────────────────────────────────────────────────────────
 
 _reindex_task: Optional[asyncio.Task] = None
+_remote_sse_tasks: list[asyncio.Task] = []
 
 
 async def _periodic_reindex():
@@ -442,12 +553,48 @@ async def _periodic_reindex():
         await asyncio.sleep(REINDEX_INTERVAL)
 
 
+async def _remote_sse_listener(cfg: dict):
+    """Background task: connect to a remote machine's SSE stream and republish events locally."""
+    import httpx
+    hostname = cfg["hostname"]
+    url = f"{cfg['url']}/api/dashboard/stream"
+    reconnect_delay = 5
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", url) as response:
+                    logger.info(f"SSE connected to {hostname}")
+                    async for line in response.aiter_lines():
+                        if not line or line.startswith(":"):
+                            continue  # comment/keepalive
+                        if line.startswith("data: "):
+                            try:
+                                event = json.loads(line[6:])
+                                event.setdefault("hostname", hostname)
+                                await event_bus.publish_global(event)
+                                # Also publish to session-specific topic
+                                sid = event.get("session_id")
+                                if sid:
+                                    await event_bus.publish(sid, event)
+                            except json.JSONDecodeError:
+                                pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"SSE listener for {hostname} disconnected: {e}")
+
+        await asyncio.sleep(reconnect_delay)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
-    global _reindex_task, _watcher_task, _needs_input_task
+    global _reindex_task, _watcher_task, _needs_input_task, _remote_sse_tasks
     logger.info("Initializing VAPID keys...")
     _init_vapid_keys()
+    logger.info("Initializing APNs client...")
+    _init_apns()
     logger.info("Starting initial reindex...")
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, indexer.reindex_all)
@@ -455,8 +602,18 @@ async def lifespan(app: FastAPI):
     _reindex_task = asyncio.create_task(_periodic_reindex())
     _watcher_task = asyncio.create_task(_jsonl_watcher())
     _needs_input_task = asyncio.create_task(_needs_input_detector())
+
+    # Start remote SSE listeners in coordinator mode
+    if _coordinator_mode and _machines_config:
+        for cfg in _machines_config:
+            task = asyncio.create_task(_remote_sse_listener(cfg))
+            _remote_sse_tasks.append(task)
+        logger.info(f"Started {len(_remote_sse_tasks)} remote SSE listener(s)")
+
     yield
-    for task in [_reindex_task, _watcher_task, _needs_input_task]:
+
+    all_tasks = [_reindex_task, _watcher_task, _needs_input_task] + _remote_sse_tasks
+    for task in all_tasks:
         if task:
             task.cancel()
             try:
@@ -467,7 +624,7 @@ async def lifespan(app: FastAPI):
 
 # ─── App setup ────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Claude Remote", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Claude Remote", version="4.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -590,6 +747,407 @@ async def index_page():
     if index_html.exists():
         return FileResponse(str(index_html))
     return HTMLResponse("<h1>Claude Remote v2.0</h1><p>Static files not found.</p>")
+
+
+# ─── API Routes: Health ──────────────────────────────────────────────────────
+
+
+@app.get("/api/health")
+async def api_health():
+    """Health check endpoint for multi-machine discovery."""
+    active_ids, tmux_ids = _get_active_and_tmux_ids()
+    return {
+        "hostname": indexer.HOSTNAME,
+        "version": "4.0.0",
+        "active_sessions": len(active_ids) + len(tmux_ids),
+        "status": "ok",
+    }
+
+
+# ─── API Routes: Machines (Coordinator) ──────────────────────────────────────
+
+
+@app.get("/api/machines")
+async def api_machines():
+    """Return all machines with health status. Coordinator mode only."""
+    import httpx
+
+    local_health = {
+        "hostname": indexer.HOSTNAME,
+        "url": None,  # local
+        "label": f"{indexer.HOSTNAME} (local)",
+        "status": "ok",
+        "active_sessions": 0,
+        "version": "4.0.0",
+    }
+    # Get local active sessions count
+    try:
+        active_ids, tmux_ids = _get_active_and_tmux_ids()
+        local_health["active_sessions"] = len(active_ids) + len(tmux_ids)
+    except Exception:
+        pass
+
+    if not _coordinator_mode:
+        return {
+            "coordinator": False,
+            "machines": [local_health],
+        }
+
+    # Check remote machines in parallel
+    results = [local_health]
+
+    async def check_remote(cfg):
+        entry = {
+            "hostname": cfg["hostname"],
+            "url": cfg["url"],
+            "label": cfg["label"],
+            "status": "offline",
+            "active_sessions": 0,
+            "version": "",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{cfg['url']}/api/health")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    entry["status"] = data.get("status", "ok")
+                    entry["active_sessions"] = data.get("active_sessions", 0)
+                    entry["version"] = data.get("version", "")
+                    entry["hostname"] = data.get("hostname", cfg["hostname"])
+        except Exception:
+            pass
+        return entry
+
+    if _machines_config:
+        remote_results = await asyncio.gather(
+            *[check_remote(cfg) for cfg in _machines_config]
+        )
+        results.extend(remote_results)
+
+    return {
+        "coordinator": True,
+        "machines": results,
+    }
+
+
+# ─── Multi-Machine Aggregation Helpers ────────────────────────────────────────
+
+
+async def _fetch_from_machine(cfg: dict, path: str, params: dict = None, timeout: float = 10.0) -> Optional[dict]:
+    """Fetch JSON from a remote machine. Returns None on failure."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{cfg['url']}{path}", params=params)
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.debug(f"Fetch from {cfg.get('hostname', cfg['url'])}{path} failed: {e}")
+    return None
+
+
+# ─── API Routes: Multi-Machine Aggregation ───────────────────────────────────
+
+
+@app.get("/api/multi/dashboard")
+async def api_multi_dashboard():
+    """Aggregated dashboard from local + all remote machines."""
+    if not _coordinator_mode:
+        # Fallback to local
+        return await api_dashboard()
+
+    local_hostname = indexer.HOSTNAME
+
+    # Fetch local dashboard
+    active_ids, tmux_ids = _get_active_and_tmux_ids()
+    loop = asyncio.get_event_loop()
+    local_data = await loop.run_in_executor(
+        None, indexer.get_dashboard_data, active_ids, tmux_ids
+    )
+
+    # Tag local data with hostname
+    for s in local_data.get("active_sessions", []):
+        s.setdefault("hostname", local_hostname)
+    for a in local_data.get("recent_activity", []):
+        a.setdefault("hostname", local_hostname)
+
+    # Fetch from remote machines in parallel
+    remote_results = await asyncio.gather(
+        *[_fetch_from_machine(cfg, "/api/dashboard") for cfg in _machines_config]
+    )
+
+    # Merge results
+    for cfg, remote_data in zip(_machines_config, remote_results):
+        if not remote_data:
+            continue
+        rhost = cfg["hostname"]
+        for s in remote_data.get("active_sessions", []):
+            s.setdefault("hostname", rhost)
+            local_data["active_sessions"].append(s)
+        for a in remote_data.get("recent_activity", []):
+            a.setdefault("hostname", rhost)
+            local_data["recent_activity"].append(a)
+        # Merge stats (additive)
+        rs = remote_data.get("stats", {})
+        ls = local_data.get("stats", {})
+        for key in ("today_sessions", "today_tokens", "week_sessions", "week_tokens", "total_sessions"):
+            ls[key] = (ls.get(key) or 0) + (rs.get(key) or 0)
+        ls["today_cost_estimate"] = round((ls.get("today_cost_estimate") or 0) + (rs.get("today_cost_estimate") or 0), 2)
+        ls["week_cost_estimate"] = round((ls.get("week_cost_estimate") or 0) + (rs.get("week_cost_estimate") or 0), 2)
+
+    # Sort recent activity by timestamp (newest first)
+    local_data["recent_activity"].sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    local_data["recent_activity"] = local_data["recent_activity"][:20]
+
+    return local_data
+
+
+@app.get("/api/multi/sessions")
+async def api_multi_sessions(
+    status: str = Query(default="all"),
+    project: Optional[str] = Query(default=None),
+    hostname: Optional[str] = Query(default=None),
+    limit: int = Query(default=30, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """Aggregated session list from all machines."""
+    if not _coordinator_mode:
+        return await api_sessions(status=status, project=project, limit=limit, offset=offset)
+
+    local_hostname = indexer.HOSTNAME
+
+    # If hostname filter matches local, just return local
+    if hostname and hostname == local_hostname:
+        return await api_sessions(status=status, project=project, limit=limit, offset=offset)
+
+    all_sessions = []
+
+    # Fetch local (unless filtering for a different hostname)
+    if not hostname or hostname == local_hostname:
+        active_ids, tmux_ids = _get_active_and_tmux_ids()
+        loop = asyncio.get_event_loop()
+        local_data = await loop.run_in_executor(
+            None, indexer.get_sessions, active_ids, tmux_ids, status, project, limit, 0
+        )
+        for s in local_data.get("sessions", []):
+            s.setdefault("hostname", local_hostname)
+        all_sessions.extend(local_data.get("sessions", []))
+
+    # Fetch from remotes
+    params = {"status": status, "limit": str(limit)}
+    if project:
+        params["project"] = project
+
+    fetch_machines = _machines_config
+    if hostname:
+        fetch_machines = [m for m in _machines_config if m["hostname"] == hostname]
+
+    remote_results = await asyncio.gather(
+        *[_fetch_from_machine(cfg, "/api/sessions", params) for cfg in fetch_machines]
+    )
+
+    for cfg, remote_data in zip(fetch_machines, remote_results):
+        if not remote_data:
+            continue
+        for s in remote_data.get("sessions", []):
+            s.setdefault("hostname", cfg["hostname"])
+            all_sessions.append(s)
+
+    # Sort by last_message descending
+    all_sessions.sort(key=lambda x: x.get("last_message", ""), reverse=True)
+
+    # Apply offset/limit
+    total = len(all_sessions)
+    paged = all_sessions[offset:offset + limit]
+
+    return {
+        "sessions": paged,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/multi/search")
+async def api_multi_search(
+    q: str = Query(default=""),
+    project: Optional[str] = Query(default=None),
+    after: Optional[str] = Query(default=None),
+    before: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """Cross-machine full-text search."""
+    if not q.strip():
+        return {"query": q, "results": [], "total": 0}
+
+    if not _coordinator_mode:
+        return await api_search(q=q, project=project, after=after, before=before, limit=limit)
+
+    local_hostname = indexer.HOSTNAME
+
+    # Fetch local
+    loop = asyncio.get_event_loop()
+    local_data = await loop.run_in_executor(
+        None, indexer.search, q, project, after, before, limit
+    )
+    for r in local_data.get("results", []):
+        r.setdefault("hostname", local_hostname)
+
+    all_results = list(local_data.get("results", []))
+
+    # Fetch from remotes
+    params = {"q": q, "limit": str(limit)}
+    if project:
+        params["project"] = project
+    if after:
+        params["after"] = after
+    if before:
+        params["before"] = before
+
+    remote_results = await asyncio.gather(
+        *[_fetch_from_machine(cfg, "/api/search", params) for cfg in _machines_config]
+    )
+
+    for cfg, remote_data in zip(_machines_config, remote_results):
+        if not remote_data:
+            continue
+        for r in remote_data.get("results", []):
+            r.setdefault("hostname", cfg["hostname"])
+            all_results.append(r)
+
+    # Sort by timestamp descending and limit
+    all_results.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    all_results = all_results[:limit]
+
+    return {
+        "query": q,
+        "results": all_results,
+        "total": len(all_results),
+    }
+
+
+# ─── API Routes: Multi-Machine Proxies (Join, Inject, Terminal) ──────────────
+
+
+def _find_machine_config(hostname: str) -> Optional[dict]:
+    """Find a remote machine config by hostname."""
+    for cfg in _machines_config:
+        if cfg["hostname"] == hostname:
+            return cfg
+    return None
+
+
+@app.post("/api/multi/sessions/{hostname}/{session_id}/join")
+async def api_multi_join(hostname: str, session_id: str):
+    """Proxy join request to the correct machine."""
+    if hostname == indexer.HOSTNAME:
+        return await join_session(session_id)
+    cfg = _find_machine_config(hostname)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Machine '{hostname}' not found")
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{cfg['url']}/api/sessions/{session_id}/join")
+            if resp.status_code == 200:
+                data = resp.json()
+                data["remote_hostname"] = hostname
+                data["remote_url"] = cfg["url"]
+                return data
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Remote machine error: {e}")
+
+
+@app.post("/api/multi/terminal/{hostname}/{session_id}/inject")
+async def api_multi_inject(hostname: str, session_id: str, body: dict = None):
+    """Proxy inject request to the correct machine."""
+    if hostname == indexer.HOSTNAME:
+        return await inject_terminal(session_id, body)
+    cfg = _find_machine_config(hostname)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Machine '{hostname}' not found")
+    if not body or "text" not in body:
+        raise HTTPException(status_code=400, detail="Missing 'text' field")
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{cfg['url']}/api/terminal/{session_id}/inject",
+                json=body
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Remote machine error: {e}")
+
+
+@app.websocket("/api/multi/terminal/{hostname}/{session_id}")
+async def api_multi_terminal(websocket: WebSocket, hostname: str, session_id: str,
+                              mode: str = Query(default="interactive")):
+    """WebSocket terminal proxy to remote machine."""
+    if hostname == indexer.HOSTNAME:
+        # Local — delegate to existing handler
+        return await terminal_websocket(websocket, session_id, mode)
+
+    cfg = _find_machine_config(hostname)
+    if not cfg:
+        await websocket.close(code=4004, reason=f"Machine '{hostname}' not found")
+        return
+
+    await websocket.accept()
+
+    # Connect to remote WebSocket
+    import httpx
+    from websockets.asyncio.client import connect as ws_connect
+
+    remote_url = cfg["url"].replace("http://", "ws://").replace("https://", "wss://")
+    remote_ws_url = f"{remote_url}/api/terminal/{session_id}?mode={mode}"
+
+    try:
+        async with ws_connect(remote_ws_url) as remote_ws:
+            async def client_to_remote():
+                """Forward client messages to remote."""
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if msg["type"] == "websocket.receive":
+                            if "bytes" in msg:
+                                await remote_ws.send(msg["bytes"])
+                            elif "text" in msg:
+                                await remote_ws.send(msg["text"])
+                        elif msg["type"] == "websocket.disconnect":
+                            break
+                except Exception:
+                    pass
+
+            async def remote_to_client():
+                """Forward remote messages to client."""
+                try:
+                    async for data in remote_ws:
+                        if isinstance(data, bytes):
+                            await websocket.send_bytes(data)
+                        else:
+                            await websocket.send_text(data)
+                except Exception:
+                    pass
+
+            # Run both directions concurrently
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(client_to_remote()),
+                 asyncio.create_task(remote_to_client())],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+    except Exception as e:
+        logger.debug(f"Terminal proxy error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ─── API Routes: Dashboard ───────────────────────────────────────────────────
@@ -912,6 +1470,38 @@ async def push_subscribe(body: dict = None):
     return {"status": "subscribed"}
 
 
+# ─── API Routes: Native Push (APNs) Device Registration ──────────────────────
+
+
+@app.post("/api/push/register")
+async def push_register_device(body: dict = None):
+    """Register a native push device token (APNs)."""
+    if not body or "device_token" not in body:
+        raise HTTPException(status_code=400, detail="Missing device_token")
+    token = body["device_token"]
+    platform = body.get("platform", "ios")
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(
+        None, indexer.register_push_device, token, platform
+    )
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to register device")
+    logger.info(f"Registered {platform} push device: {token[:16]}...")
+    return {"status": "registered"}
+
+
+@app.delete("/api/push/register")
+async def push_unregister_device(body: dict = None):
+    """Unregister a native push device token."""
+    if not body or "device_token" not in body:
+        raise HTTPException(status_code=400, detail="Missing device_token")
+    token = body["device_token"]
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, indexer.unregister_push_device, token)
+    logger.info(f"Unregistered push device: {token[:16]}...")
+    return {"status": "unregistered"}
+
+
 # ─── WebSocket Terminal (preserved from v0.5) ────────────────────────────────
 
 
@@ -1025,8 +1615,42 @@ if static_dir.exists():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def _find_tailscale_certs() -> tuple[Optional[str], Optional[str]]:
+    """Find Tailscale TLS certificate and key files."""
+    import platform as _platform
+    hostname = indexer.HOSTNAME
+
+    # Possible cert locations by platform
+    search_paths = []
+    if _platform.system() == "Darwin":
+        ts_dir = Path.home() / "Library/Group Containers/io.tailscale.ipn.macos"
+        search_paths.append(ts_dir)
+    elif _platform.system() == "Linux":
+        search_paths.append(Path("/var/run/tailscale"))
+
+    # Also check user home (manual tailscale cert generation)
+    search_paths.append(Path.home())
+    search_paths.append(Path.home() / ".claude-remote")
+
+    for base in search_paths:
+        # Try common patterns
+        for pattern in [f"{hostname}.crt", f"{hostname}.*.ts.net.crt"]:
+            for cert_file in base.glob(pattern):
+                key_file = cert_file.with_suffix(".key")
+                if key_file.exists():
+                    return str(cert_file), str(key_file)
+
+    return None, None
+
+
 if __name__ == "__main__":
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="Claude Remote v4.0 - Fleet Dashboard")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Server port (default: {DEFAULT_PORT})")
+    parser.add_argument("--coordinator", action="store_true", help="Enable coordinator mode (aggregate remote machines)")
+    parser.add_argument("--https", action="store_true", help="Enable HTTPS via Tailscale certificates")
+    args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -1036,5 +1660,30 @@ if __name__ == "__main__":
     if not shutil.which("tmux"):
         print("WARNING: tmux not found - terminal features will be unavailable")
 
-    print(f"Starting Claude Remote v2.0 on http://0.0.0.0:{DEFAULT_PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=DEFAULT_PORT)
+    # Configure coordinator mode
+    _coordinator_mode = args.coordinator
+    if _coordinator_mode:
+        _machines_config = _load_machines_config()
+        logger.info(f"Coordinator mode: {len(_machines_config)} remote machine(s) configured")
+        for m in _machines_config:
+            logger.info(f"  -> {m['label']} ({m['url']})")
+
+    # Configure HTTPS
+    ssl_kwargs = {}
+    if args.https:
+        cert_file, key_file = _find_tailscale_certs()
+        if cert_file and key_file:
+            ssl_kwargs["ssl_certfile"] = cert_file
+            ssl_kwargs["ssl_keyfile"] = key_file
+            logger.info(f"HTTPS enabled: {cert_file}")
+        else:
+            logger.warning(
+                "HTTPS requested but no Tailscale certs found. "
+                f"Run: tailscale cert {indexer.HOSTNAME}.<tailnet>.ts.net"
+            )
+            logger.warning("Falling back to HTTP")
+
+    protocol = "https" if ssl_kwargs else "http"
+    mode_str = " [coordinator]" if _coordinator_mode else ""
+    print(f"Starting Claude Remote v4.0{mode_str} on {protocol}://0.0.0.0:{args.port}")
+    uvicorn.run(app, host="0.0.0.0", port=args.port, **ssl_kwargs)

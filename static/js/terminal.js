@@ -77,9 +77,16 @@ CR.terminal = {
         CR.state.term = term;
         CR.state.fitAddon = fitAddon;
 
-        // WebSocket connection
+        // WebSocket connection — use multi proxy for remote sessions
         var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        var wsUrl = protocol + '//' + location.host + '/api/terminal/' + encodeURIComponent(sessionId) + '?mode=' + mode;
+        var hostname = CR.state.currentSessionHostname;
+        var wsPath;
+        if (CR.state.coordinatorMode && hostname && hostname !== CR.state.localHostname) {
+            wsPath = '/api/multi/terminal/' + encodeURIComponent(hostname) + '/' + encodeURIComponent(sessionId);
+        } else {
+            wsPath = '/api/terminal/' + encodeURIComponent(sessionId);
+        }
+        var wsUrl = protocol + '//' + location.host + wsPath + '?mode=' + mode;
         var ws = new WebSocket(wsUrl);
         ws.binaryType = 'arraybuffer';
 
